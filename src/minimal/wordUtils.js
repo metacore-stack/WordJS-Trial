@@ -331,6 +331,8 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
                   
                   // Direct approach: Search for target in the document body with additional context
                   // Use the before and after context from the pattern to ensure correct match
+                  // CRITICAL: Since we process deletions in reverse order, prefer after context
+                  // as it's less likely to have been modified by previous deletions
                   const beforeCtx = normalizeText(op.context.beforeContext);
                   const afterCtx = normalizeText(op.context.afterContext);
                   
@@ -543,10 +545,50 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
                     if (directSearch.items && directSearch.items.length > 0) {
                       console.log(`      Found ${directSearch.items.length} matches, selecting based on deletion order`);
                       
-                      // Since we process in REVERSE order (end to start), we want matches
-                      // that appear LATER in the document for EARLIER deletions in our loop
-                      // Use the LAST match as it's most likely to be the one we haven't deleted yet
-                      const selectedMatch = directSearch.items[directSearch.items.length - 1];
+                      let selectedMatch = null;
+                      
+                      // If multiple matches, try to use after context to narrow it down
+                      if (directSearch.items.length > 1) {
+                        const afterCtx = normalizeText(op.context.afterContext);
+                        if (afterCtx.length >= 5) {
+                          // Search for target + after context to find the correct match
+                          const combinedPattern = targetText + afterCtx.substring(0, Math.min(20, afterCtx.length));
+                          try {
+                            const body = context.document.body;
+                            const combinedSearch = body.search(combinedPattern.substring(0, 255), {
+                              matchCase: false,
+                              matchWholeWord: false
+                            });
+                            combinedSearch.load('items');
+                            await context.sync();
+                            
+                            if (combinedSearch.items && combinedSearch.items.length > 0) {
+                              // Found the combined pattern - search for target within it
+                              const combinedRange = combinedSearch.items[0];
+                              const targetInCombined = combinedRange.search(targetText, {
+                                matchCase: false,
+                                matchWholeWord: false
+                              });
+                              targetInCombined.load('items');
+                              await context.sync();
+                              
+                              if (targetInCombined.items && targetInCombined.items.length > 0) {
+                                selectedMatch = targetInCombined.items[0];
+                                console.log(`      Selected match using target+after-context pattern`);
+                              }
+                            }
+                          } catch (e) {
+                            console.warn(`      Combined search failed: ${e.message}`);
+                          }
+                        }
+                      }
+                      
+                      // Fallback: Since we process in REVERSE order (end to start), use the LAST match
+                      // as it's most likely to be the one we haven't deleted yet
+                      if (!selectedMatch) {
+                        selectedMatch = directSearch.items[directSearch.items.length - 1];
+                      }
+                      
                       selectedMatch.delete();
                       await context.sync();
                       applied++;
@@ -569,8 +611,106 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
                   console.warn(`   ?? Target not found in matched pattern`);
                 }
               } else {
-                skipped++;
-                console.warn(`   ?? Pattern not found in document`);
+                // Pattern not found - try multiple fallback strategies
+                console.warn(`   ?? Full pattern not found, trying fallback strategies`);
+                const afterCtx = normalizeText(op.context.afterContext);
+                const beforeCtx = normalizeText(op.context.beforeContext);
+                const targetText = normalizeText(op.text);
+                let deletedSuccessfully = false;
+                
+                // Fallback 1: Try with after context (even if short)
+                if (!deletedSuccessfully && afterCtx.length >= 3) {
+                  console.log(`   Fallback 1: Trying after-context search (${afterCtx.length} chars)`);
+                  try {
+                    const afterOnlyPattern = targetText + afterCtx.substring(0, Math.min(50, afterCtx.length));
+                    const body = context.document.body;
+                    const afterSearch = body.search(afterOnlyPattern.substring(0, 255), {
+                      matchCase: false,
+                      matchWholeWord: false
+                    });
+                    afterSearch.load('items');
+                    await context.sync();
+                    
+                    if (afterSearch.items && afterSearch.items.length > 0) {
+                      const afterRange = afterSearch.items[0];
+                      const targetSearch = afterRange.search(targetText, {matchCase: false, matchWholeWord: false});
+                      targetSearch.load('items');
+                      await context.sync();
+                      
+                      if (targetSearch.items && targetSearch.items.length > 0) {
+                        targetSearch.items[0].delete();
+                        await context.sync();
+                        applied++;
+                        deletedSuccessfully = true;
+                        console.log(`   ? Deleted (fallback 1: after-context)`);
+                      }
+                    }
+                  } catch (e) {
+                    console.warn(`   ?? Fallback 1 failed: ${e.message}`);
+                  }
+                }
+                
+                // Fallback 2: Try with before context (if after failed)
+                if (!deletedSuccessfully && beforeCtx.length >= 3) {
+                  console.log(`   Fallback 2: Trying before-context search (${beforeCtx.length} chars)`);
+                  try {
+                    const beforeOnlyPattern = beforeCtx.substring(Math.max(0, beforeCtx.length - 50)) + targetText;
+                    const body = context.document.body;
+                    const beforeSearch = body.search(beforeOnlyPattern.substring(0, 255), {
+                      matchCase: false,
+                      matchWholeWord: false
+                    });
+                    beforeSearch.load('items');
+                    await context.sync();
+                    
+                    if (beforeSearch.items && beforeSearch.items.length > 0) {
+                      const beforeRange = beforeSearch.items[0];
+                      const targetSearch = beforeRange.search(targetText, {matchCase: false, matchWholeWord: false});
+                      targetSearch.load('items');
+                      await context.sync();
+                      
+                      if (targetSearch.items && targetSearch.items.length > 0) {
+                        // Use the last match (closest to end of before context)
+                        const matchIndex = Math.min(targetSearch.items.length - 1, Math.max(0, targetSearch.items.length - 1));
+                        targetSearch.items[matchIndex].delete();
+                        await context.sync();
+                        applied++;
+                        deletedSuccessfully = true;
+                        console.log(`   ? Deleted (fallback 2: before-context)`);
+                      }
+                    }
+                  } catch (e) {
+                    console.warn(`   ?? Fallback 2 failed: ${e.message}`);
+                  }
+                }
+                
+                // Fallback 3: Direct search (last resort)
+                if (!deletedSuccessfully) {
+                  console.log(`   Fallback 3: Trying direct search`);
+                  try {
+                    const body = context.document.body;
+                    const directSearch = body.search(targetText, {matchCase: false, matchWholeWord: false});
+                    directSearch.load('items');
+                    await context.sync();
+                    
+                    if (directSearch.items && directSearch.items.length > 0) {
+                      // Since we process in reverse order, use the last match
+                      const selectedMatch = directSearch.items[directSearch.items.length - 1];
+                      selectedMatch.delete();
+                      await context.sync();
+                      applied++;
+                      deletedSuccessfully = true;
+                      console.log(`   ? Deleted (fallback 3: direct search, match ${directSearch.items.length} of ${directSearch.items.length})`);
+                    }
+                  } catch (e) {
+                    console.warn(`   ?? Fallback 3 failed: ${e.message}`);
+                  }
+                }
+                
+                if (!deletedSuccessfully) {
+                  skipped++;
+                  console.warn(`   ?? All fallbacks failed, pattern not found in document`);
+                }
               }
             } else {
               skipped++;
