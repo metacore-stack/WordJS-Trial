@@ -314,13 +314,13 @@ export function computeWordLevelDiff(oldText, newText) {
     
     for (const part of parts) {
       if (part.hasNewline) {
-        // Newline is a separate operation
+        // Newline is a separate operation - mark it specially so it can be handled differently
         if (op === 0) {
-          wordDiffs.push({ op: 'equal', text: part.text });
+          wordDiffs.push({ op: 'equal', text: part.text, isNewline: true });
         } else if (op === -1) {
-          wordDiffs.push({ op: 'delete', text: part.text });
+          wordDiffs.push({ op: 'delete', text: part.text, isNewline: true });
         } else if (op === 1) {
-          wordDiffs.push({ op: 'insert', text: part.text });
+          wordDiffs.push({ op: 'insert', text: part.text, isNewline: true });
         }
       } else if (part.text) {
         // Regular text (non-empty)
@@ -349,7 +349,7 @@ export function computeWordLevelDiff(oldText, newText) {
     const current = wordDiffs[i];
     
     // Check if current is a delete newline
-    if (current.op === 'delete' && (current.text === '\r' || current.text === '\n')) {
+    if (current.op === 'delete' && (current.isNewline || current.text === '\r' || current.text === '\n')) {
       // Look ahead to see if there's a matching insert newline
       // They should be in the same logical position if there are only text changes between them
       let foundMatchingInsert = false;
@@ -360,7 +360,7 @@ export function computeWordLevelDiff(oldText, newText) {
         const candidate = wordDiffs[j];
         
         // If we find an insert newline, check if it's in the same logical position
-        if (candidate.op === 'insert' && (candidate.text === '\r' || candidate.text === '\n')) {
+        if (candidate.op === 'insert' && (candidate.isNewline || candidate.text === '\r' || candidate.text === '\n')) {
           // Check if there are only text changes (delete/insert) between them, no equal ops
           // This indicates they're in the same logical position
           let onlyTextChanges = true;
@@ -373,7 +373,7 @@ export function computeWordLevelDiff(oldText, newText) {
           
           if (onlyTextChanges) {
             // Merge into equal operation (newline is unchanged, just normalized)
-            mergedDiffs.push({ op: 'equal', text: '\r' }); // Use \r for Word
+            mergedDiffs.push({ op: 'equal', text: '\r', isNewline: true }); // Use \r for Word
             
             // Add all operations between (they're text changes)
             for (let k = i + 1; k < j; k++) {
@@ -387,7 +387,7 @@ export function computeWordLevelDiff(oldText, newText) {
         }
         
         // Count non-newline operations
-        if (candidate.text !== '\r' && candidate.text !== '\n') {
+        if (!candidate.isNewline && candidate.text !== '\r' && candidate.text !== '\n') {
           textOpsBetween++;
         }
         

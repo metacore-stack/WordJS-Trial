@@ -9,13 +9,27 @@
  */
 
 /**
+ * Placeholder token for newlines - must be unique and unlikely to appear in real text
+ */
+const NEWLINE_PLACEHOLDER = '___NEWLINE_PLACEHOLDER_XYZ123___';
+
+/**
  * Normalize text for comparison
- * CRITICAL: Remove \r (carriage return) because Word's search API can't match it
+ * CRITICAL: Replace \r with placeholder so newlines can be handled as regular text
+ * Word's search API can't match \r reliably, so we use a placeholder
  */
 function normalizeText(text) {
   if (!text) return '';
-  // Remove carriage returns (\r) then normalize Unicode
-  return text.replace(/\r/g, '').normalize('NFC');
+  // Replace carriage returns (\r) with placeholder, then normalize Unicode
+  return text.replace(/\r/g, NEWLINE_PLACEHOLDER).normalize('NFC');
+}
+
+/**
+ * Convert placeholder back to newline character
+ */
+function denormalizeText(text) {
+  if (!text) return '';
+  return text.replace(new RegExp(NEWLINE_PLACEHOLDER.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '\r');
 }
 
 /**
@@ -98,9 +112,12 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
       
     const originalText = selection.text;
     
-    // CRITICAL FIX: Normalize the original text by removing carriage returns
-    // Word's search API doesn't match \r characters reliably
+    // CRITICAL FIX: Replace newlines with placeholder so they can be handled as regular text
+    // Build normalized text by replacing \r with placeholder
+    // We'll work with this normalized version for all operations
     const normalized = normalizeText(originalText);
+    
+    console.log(`?? Text normalization: ${originalText.length} chars -> ${normalized.length} chars (newlines replaced with placeholder)`);
     
     console.log(`?? Starting maximum-precision tracking`);
     console.log(`   Processing ${diffs.length} diffs`);
@@ -123,6 +140,7 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
     // Build position map with enhanced verification
     const positionMap = [];
     let currentPos = 0;
+    let originalPos = 0; // Track position in original text (without placeholders)
     // normalized is already defined above (line 100)
     
     console.log('?? Building position map with uniqueness verification...');
@@ -137,20 +155,83 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
         const slice = normalized.slice(currentPos, currentPos + normText.length);
         if (slice === normText) {
           currentPos += normText.length;
+          originalPos += diff.text.length; // Track original position
         } else {
           // Try to find nearby
           const searchIdx = normalized.indexOf(normText, Math.max(0, currentPos - 30));
           if (searchIdx >= 0 && searchIdx < currentPos + 150) {
             currentPos = searchIdx + normText.length;
+            originalPos += diff.text.length; // Track original position
           } else {
             console.warn(`?? [Diff ${i}] Could not align equal text (skipping)`);
           }
         }
       } else if (diff.op === 'delete') {
-        // Skip deletions that normalize to empty string (e.g., pure \r deletions)
-        if (normText.length === 0) {
-          console.log(`? [Diff ${i}] Delete normalized to empty (e.g., \\r) - auto-skipping`);
-          continue; // Nothing to delete
+        // CRITICAL: Don't skip newline deletions - they normalize to empty but must be handled specially
+        // Check if this is a newline deletion (marked with isNewline flag or contains only newline chars)
+        const isNewlineDelete = diff.isNewline || (diff.text === '\r' || diff.text === '\n' || diff.text === '\r\n');
+        
+        if (normText.length === 0 && !isNewlineDelete) {
+          console.log(`? [Diff ${i}] Delete normalized to empty (non-newline) - auto-skipping`);
+          continue; // Nothing to delete (but not a newline)
+        }
+        
+        // For newline deletions, build context from ORIGINAL text (not normalized with placeholders)
+        // because placeholders don't exist in the Word document
+        if (isNewlineDelete) {
+          // Build context from original text (without placeholders)
+          // The newline is at originalPos in the original text
+          const contextSize = 50;
+          const beforeStart = Math.max(0, originalPos - contextSize);
+          const afterEnd = Math.min(originalText.length, originalPos + diff.text.length + contextSize);
+          
+          // Get context from original text
+          let beforeContext = originalText.substring(beforeStart, originalPos);
+          let afterContext = originalText.substring(originalPos + diff.text.length, afterEnd);
+          
+          // Clean context: remove \r but don't add placeholders (just remove them)
+          beforeContext = beforeContext.replace(/\r/g, '').normalize('NFC');
+          afterContext = afterContext.replace(/\r/g, '').normalize('NFC');
+          
+          // For newlines, we don't need to verify uniqueness in normalized text
+          // because we use paragraph-based matching, not text search
+          // Just use the context we built from original text
+          const uniqueContext = {
+            pattern: beforeContext + NEWLINE_PLACEHOLDER + afterContext,
+            target: NEWLINE_PLACEHOLDER,
+            beforeContext: beforeContext,
+            afterContext: afterContext,
+            isUnique: false, // Not checked - we use paragraph matching instead
+            contextSize: contextSize,
+            positionInOriginal: originalPos
+          };
+          
+          positionMap.push({
+            index: i,
+            op: 'delete',
+            start: currentPos,
+            end: currentPos + NEWLINE_PLACEHOLDER.length,
+            text: NEWLINE_PLACEHOLDER,
+            originalText: diff.text,
+            context: uniqueContext,
+            length: NEWLINE_PLACEHOLDER.length,
+            isNewline: true
+          });
+          
+          console.log(`? [Diff ${i}] Newline deletion with context (before: "${beforeContext.substring(Math.max(0, beforeContext.length - 20))}", after: "${afterContext.substring(0, Math.min(20, afterContext.length))}")`);
+          currentPos += NEWLINE_PLACEHOLDER.length;
+          originalPos += diff.text.length; // Track original position
+          continue;
+        }
+        
+        // Regular deletion - track original position
+        originalPos += diff.text.length;
+        
+        // CRITICAL: Skip if this normalized to a placeholder (should have been caught above, but double-check)
+        if (normText === NEWLINE_PLACEHOLDER) {
+          console.warn(`?? [Diff ${i}] Placeholder detected in regular deletion path - this should not happen`);
+          currentPos += NEWLINE_PLACEHOLDER.length;
+          continue;
         }
         
         const slice = normalized.slice(currentPos, currentPos + normText.length);
@@ -177,6 +258,13 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
           currentPos += normText.length;
         } else {
           // Try to find nearby
+          // CRITICAL: Skip if this is a placeholder (should have been caught above)
+          if (normText === NEWLINE_PLACEHOLDER) {
+            console.warn(`?? [Diff ${i}] Placeholder detected in fallback deletion path - this should not happen`);
+            currentPos += NEWLINE_PLACEHOLDER.length;
+            continue;
+          }
+          
           const searchIdx = normalized.indexOf(normText, Math.max(0, currentPos - 30));
           if (searchIdx >= 0 && searchIdx < currentPos + 150) {
             const context = findUniqueContext(normalized, searchIdx, searchIdx + normText.length, diff.text);
@@ -197,17 +285,69 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
           }
         }
       } else if (diff.op === 'insert') {
-        // Find unique context for insertion point (use normalized text to avoid \r issues)
-        const insertContext = findUniqueContext(normalized, currentPos, currentPos, '');
+        // Check if this is a newline insertion
+        const isNewlineInsert = diff.isNewline || (diff.text === '\r' || diff.text === '\n' || diff.text === '\r\n');
         
-        positionMap.push({
-          index: i,
-          op: 'insert',
-          position: currentPos,
-          text: diff.text,
-          context: insertContext,
-          length: normalizeText(diff.text).length
-        });
+        // For newline insertions, build context from ORIGINAL text (not normalized with placeholders)
+        if (isNewlineInsert) {
+          // Build context from original text at insertion point
+          const contextSize = 50;
+          const beforeStart = Math.max(0, originalPos - contextSize);
+          const afterEnd = Math.min(originalText.length, originalPos + contextSize);
+          
+          // Get context from original text
+          let beforeContext = originalText.substring(beforeStart, originalPos);
+          let afterContext = originalText.substring(originalPos, afterEnd);
+          
+          // Clean context: remove \r but don't add placeholders
+          beforeContext = beforeContext.replace(/\r/g, '').normalize('NFC');
+          afterContext = afterContext.replace(/\r/g, '').normalize('NFC');
+          
+          const insertContext = {
+            pattern: beforeContext + NEWLINE_PLACEHOLDER + afterContext,
+            target: NEWLINE_PLACEHOLDER,
+            beforeContext: beforeContext,
+            afterContext: afterContext,
+            isUnique: false, // Will be checked during insertion
+            contextSize: contextSize,
+            positionInOriginal: originalPos
+          };
+          
+          positionMap.push({
+            index: i,
+            op: 'insert',
+            position: currentPos,
+            text: NEWLINE_PLACEHOLDER, // Use placeholder for newlines
+            originalText: diff.text, // Keep original for reference
+            context: insertContext,
+            length: NEWLINE_PLACEHOLDER.length,
+            isNewline: true // Mark as newline for final conversion
+          });
+          
+          // Don't advance originalPos for insertions (they're not in the original text yet)
+          currentPos += NEWLINE_PLACEHOLDER.length;
+        } else {
+          // Regular insertion - use normalized text for context
+          const insertText = diff.text;
+          const insertTextNormalized = normalizeText(insertText);
+          
+          // Find unique context for insertion point
+          const insertContext = findUniqueContext(normalized, currentPos, currentPos, '');
+          
+          positionMap.push({
+            index: i,
+            op: 'insert',
+            position: currentPos,
+            text: insertText,
+            originalText: diff.text,
+            context: insertContext,
+            length: insertTextNormalized.length,
+            isNewline: false
+          });
+          
+          // Don't advance originalPos for insertions
+          currentPos += insertTextNormalized.length;
+        }
         
         if (!insertContext.isUnique) {
           console.warn(`?? [Diff ${i}] Insert position not unique (will try best match)`);
@@ -265,9 +405,239 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
         }
         
         if (op.op === 'delete') {
+            // Handle newline deletions as regular text (they're placeholders now)
+            if (op.isNewline) {
+              console.log(`${prefix} DELETE NEWLINE (as placeholder) at pos ${op.start}: "${op.text}"`);
+              // Treat as regular text deletion - the placeholder is in the normalized text
+              // We'll search for it using the context, but need to find the actual paragraph break location
+              
+              // Since placeholders aren't actually in the document, we need to find the paragraph break
+              // by searching for the context and checking for paragraph boundaries
+              let deletedSuccessfully = false;
+              
+              try {
+                const body = context.document.body;
+                // Context is already cleaned (no \r, no placeholders) - use it directly
+                // Don't call normalizeText again as it might add placeholders
+                const beforeCtx = op.context.beforeContext;
+                const afterCtx = op.context.afterContext;
+                
+                // Search for before context + after context to find the location
+                if (beforeCtx.length >= 5 && afterCtx.length >= 5) {
+                  const searchText = beforeCtx.substring(Math.max(0, beforeCtx.length - 30)) + 
+                                    afterCtx.substring(0, Math.min(30, afterCtx.length));
+                  
+                  // But wait - the search won't work because there's a paragraph break between them
+                  // So search for before context, then check what comes after
+                  const beforeSearch = beforeCtx.substring(Math.max(0, beforeCtx.length - 50));
+                  const searchResults = body.search(beforeSearch, {
+                    matchCase: false,
+                    matchWholeWord: false
+                  });
+                  searchResults.load('items');
+                  await context.sync();
+                  
+                  if (searchResults.items && searchResults.items.length > 0) {
+                    const beforeRange = searchResults.items[0];
+                    const paragraphs = body.paragraphs;
+                    paragraphs.load('items');
+                    await context.sync();
+                    
+                    // Find the paragraph containing beforeRange
+                    for (let pIdx = 0; pIdx < paragraphs.items.length - 1; pIdx++) {
+                      const para = paragraphs.items[pIdx];
+                      para.load('text');
+                      await context.sync();
+                      
+                      // Normalize paragraph text (remove \r but don't add placeholders)
+                      const paraText = para.text.replace(/\r/g, '').normalize('NFC');
+                      const beforeCtxEnd = beforeCtx.substring(Math.max(0, beforeCtx.length - 40));
+                      
+                      if (paraText.endsWith(beforeCtxEnd)) {
+                        // Found the paragraph! Check next paragraph
+                        if (pIdx < paragraphs.items.length - 1) {
+                          const nextPara = paragraphs.items[pIdx + 1];
+                          nextPara.load('text');
+                          await context.sync();
+                          
+                          // Normalize next paragraph text (remove \r but don't add placeholders)
+                          const nextParaText = nextPara.text.replace(/\r/g, '').normalize('NFC');
+                          
+                          // Check if next paragraph is empty (the newline)
+                          if (nextParaText.trim().length === 0) {
+                            nextPara.delete();
+                            await context.sync();
+                            deletedSuccessfully = true;
+                            applied++;
+                            console.log(`   ? Newline deleted (empty paragraph removed)`);
+                            break;
+                          }
+                          
+                          // Check if next paragraph matches after context
+                          if (afterCtx.length >= 5) {
+                            const afterCtxStart = afterCtx.substring(0, Math.min(40, afterCtx.length));
+                            const nextParaTrimmed = nextParaText.trimStart();
+                            const afterCtxTrimmed = afterCtxStart.trimStart();
+                            
+                            // More lenient matching - check if significant portion matches
+                            const minMatchLen = Math.min(10, afterCtxTrimmed.length, nextParaTrimmed.length);
+                            if (minMatchLen > 0 && nextParaTrimmed.substring(0, minMatchLen) === afterCtxTrimmed.substring(0, minMatchLen)) {
+                              // Merge paragraphs to delete the newline
+                              const nextParaTextContent = nextPara.text;
+                              para.insertText(nextParaTextContent, Word.InsertLocation.end);
+                              nextPara.delete();
+                              await context.sync();
+                              
+                              deletedSuccessfully = true;
+                              applied++;
+                              console.log(`   ? Newline deleted successfully (paragraphs merged)`);
+                              break;
+                            } else {
+                              console.log(`   ? Next paragraph doesn't match: "${nextParaTrimmed.substring(0, Math.min(20, nextParaTrimmed.length))}" vs "${afterCtxTrimmed.substring(0, Math.min(20, afterCtxTrimmed.length))}"`);
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+                
+                if (!deletedSuccessfully) {
+                  skipped++;
+                  console.warn(`   ?? Could not find newline to delete`);
+                }
+              } catch (e) {
+                skipped++;
+                console.error(`   ?? Error deleting newline: ${e.message}`);
+              }
+              
+              continue; // Skip regular deletion processing
+            }
+            
+            // Regular text deletion
             console.log(`${prefix} DELETE at pos ${op.start}: "${op.text.substring(0, 40)}..."`);
             console.log(`           Position in original: ${op.start}-${op.end}`);
             
+            // Check if this is a placeholder (for newlines that are now regular text)
+            const isPlaceholder = op.text === NEWLINE_PLACEHOLDER;
+            const targetText = isPlaceholder ? NEWLINE_PLACEHOLDER : normalizeText(op.text);
+            
+            let deletedSuccessfully = false;
+            
+            // For placeholders, we need special handling since they're not actually in the document
+            if (isPlaceholder) {
+              // Placeholder represents a newline - find the paragraph break and merge paragraphs
+              // Context is already cleaned (no \r, no placeholders) - use it directly
+              const beforeCtx = op.context.beforeContext;
+              const afterCtx = op.context.afterContext;
+              
+              console.log(`   ? Deleting placeholder (newline) - searching for paragraph break`);
+              
+              const body = context.document.body;
+              
+              // Search for before context to find the paragraph
+              if (beforeCtx.length >= 5) {
+                const beforeSearch = beforeCtx.substring(Math.max(0, beforeCtx.length - 50));
+                const searchResults = body.search(beforeSearch, {
+                  matchCase: false,
+                  matchWholeWord: false
+                });
+                searchResults.load('items');
+                await context.sync();
+                
+                if (searchResults.items && searchResults.items.length > 0) {
+                  const paragraphs = body.paragraphs;
+                  paragraphs.load('items');
+                  await context.sync();
+                  
+                  // Find paragraph that ends with before context
+                  for (let pIdx = 0; pIdx < paragraphs.items.length - 1; pIdx++) {
+                    const para = paragraphs.items[pIdx];
+                    para.load('text');
+                    await context.sync();
+                    
+                    // Normalize paragraph text the same way as context (remove \r, no placeholders)
+                    const paraText = para.text.replace(/\r/g, '').normalize('NFC');
+                    const beforeCtxEnd = beforeCtx.substring(Math.max(0, beforeCtx.length - 40));
+                    
+                    if (paraText.endsWith(beforeCtxEnd)) {
+                      // Found the paragraph! Check next paragraph
+                      if (pIdx < paragraphs.items.length - 1) {
+                        const nextPara = paragraphs.items[pIdx + 1];
+                        nextPara.load('text');
+                        await context.sync();
+                        
+                        // Normalize next paragraph text the same way (remove \r, no placeholders)
+                        const nextParaText = nextPara.text.replace(/\r/g, '').normalize('NFC');
+                        
+                        // Check if next paragraph is empty (the newline)
+                        if (nextParaText.trim().length === 0) {
+                          nextPara.delete();
+                          await context.sync();
+                          deletedSuccessfully = true;
+                          applied++;
+                          console.log(`   ? Newline deleted (empty paragraph removed)`);
+                          break;
+                        }
+                        
+                        // Check if next paragraph matches after context
+                        if (afterCtx.length >= 5) {
+                          const afterCtxStart = afterCtx.substring(0, Math.min(40, afterCtx.length));
+                          const nextParaTrimmed = nextParaText.trimStart();
+                          const afterCtxTrimmed = afterCtxStart.trimStart();
+                          
+                          // More lenient matching - check if significant portion matches
+                          const minMatchLen = Math.min(10, afterCtxTrimmed.length, nextParaTrimmed.length);
+                          if (minMatchLen > 0 && nextParaTrimmed.substring(0, minMatchLen) === afterCtxTrimmed.substring(0, minMatchLen)) {
+                            // Merge paragraphs
+                            const nextParaTextContent = nextPara.text;
+                            para.insertText(nextParaTextContent, Word.InsertLocation.end);
+                            nextPara.delete();
+                            await context.sync();
+                            deletedSuccessfully = true;
+                            applied++;
+                            console.log(`   ? Newline deleted (paragraphs merged)`);
+                            break;
+                          }
+                        }
+                      } else {
+                        // This is the last paragraph - check if after context is empty (trailing newline)
+                        if (afterCtx.length === 0 || afterCtx.trim().length === 0) {
+                          // Trailing newline - already handled (implicit paragraph break)
+                          deletedSuccessfully = true;
+                          applied++;
+                          console.log(`   ? Trailing newline handled (implicit paragraph break)`);
+                          break;
+                        }
+                      }
+                      
+                      // Fallback: Check if the paragraph already contains the after context
+                      // (meaning paragraphs were already merged by a previous operation)
+                      if (!deletedSuccessfully && afterCtx.length >= 5) {
+                        const afterCtxStart = afterCtx.substring(0, Math.min(30, afterCtx.length));
+                        const paraTextAfter = paraText.substring(paraText.length - Math.min(100, paraText.length));
+                        if (paraTextAfter.includes(afterCtxStart)) {
+                          // Paragraph already contains after context - newline already deleted
+                          deletedSuccessfully = true;
+                          applied++;
+                          console.log(`   ? Newline already deleted (paragraphs already merged)`);
+                          break;
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+              
+              if (!deletedSuccessfully) {
+                skipped++;
+                console.warn(`   ?? Could not find newline/paragraph break to delete`);
+              }
+              
+              continue; // Skip regular deletion processing for placeholders
+            }
+            
+            // Regular text deletion logic
             // Strategy 1: Search with full unique pattern
             if (op.context.isUnique) {
               console.log(`   ? Using GUARANTEED unique pattern (${op.context.pattern.length} chars)`);
@@ -964,6 +1334,150 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
             }
           
         } else if (op.op === 'insert') {
+          // SPECIAL HANDLING: Newline insertions must use Word insertBreak() API
+          if (op.isNewline) {
+            console.log(`${prefix} INSERT NEWLINE at pos ${op.position}`);
+            console.log(`           Using Word insertBreak() API for newline insertion`);
+            
+            let insertedSuccessfully = false;
+            
+            try {
+              const body = context.document.body;
+              const beforeCtx = normalizeText(op.context.beforeContext);
+              const afterCtx = normalizeText(op.context.afterContext);
+              
+              // Try to find the insertion point using before context
+              // CRITICAL: Since insertions happen in reverse order, other insertions may have already occurred
+              // First try searching for before context + common insertion characters (like ":")
+              if (beforeCtx.length >= 5) {
+                const baseSearchText = beforeCtx.substring(Math.max(0, beforeCtx.length - 50));
+                const commonInsertions = [':', ';', ',', '.', '!', '?'];
+                let foundRange = null;
+                let foundChar = null;
+                
+                // First, try to find before context + insertion character (most likely scenario)
+                for (const insertChar of commonInsertions) {
+                  const searchWithChar = baseSearchText + insertChar;
+                  const searchResults = body.search(searchWithChar, {
+                    matchCase: false,
+                    matchWholeWord: false
+                  });
+                  searchResults.load('items');
+                  await context.sync();
+                  
+                  if (searchResults.items && searchResults.items.length > 0) {
+                    foundRange = searchResults.items[0];
+                    foundChar = insertChar;
+                    console.log(`      Found before context + "${insertChar}" - will insert newline after this`);
+                    break;
+                  }
+                }
+                
+                // If not found with insertion character, try just the before context
+                if (!foundRange) {
+                  const searchResults = body.search(baseSearchText, {
+                    matchCase: false,
+                    matchWholeWord: false
+                  });
+                  searchResults.load('items');
+                  await context.sync();
+                  
+                  if (searchResults.items && searchResults.items.length > 0) {
+                    foundRange = searchResults.items[0];
+                    console.log(`      Found before context only - will insert newline after it`);
+                  }
+                }
+                
+                if (foundRange) {
+                  // Get the range after the found text
+                  const insertPoint = foundRange.getRange(Word.RangeLocation.after);
+                  
+                  // Insert the newline (paragraph break)
+                  try {
+                    // Try insertBreak first (line break)
+                    insertPoint.insertBreak(Word.BreakType.line, Word.InsertLocation.before);
+                    await context.sync();
+                    insertedSuccessfully = true;
+                    applied++;
+                    console.log(`   ? Newline inserted successfully using insertBreak(line)${foundChar ? ` after "${foundChar}"` : ''}`);
+                  } catch (breakError) {
+                    // insertBreak might not be available, use insertParagraph
+                    console.log(`      insertBreak not available, using insertParagraph`);
+                    const newPara = insertPoint.insertParagraph('', Word.InsertLocation.before);
+                    newPara.font.color = '#0000FF'; // Blue for insertions
+                    await context.sync();
+                    insertedSuccessfully = true;
+                    applied++;
+                    console.log(`   ? Newline inserted successfully using insertParagraph${foundChar ? ` after "${foundChar}"` : ''}`);
+                  }
+                }
+              }
+              
+              // Fallback: Try after context if before context failed
+              if (!insertedSuccessfully && afterCtx.length >= 5) {
+                const searchText = afterCtx.substring(0, Math.min(50, afterCtx.length));
+                const searchResults = body.search(searchText, {
+                  matchCase: false,
+                  matchWholeWord: false
+                });
+                searchResults.load('items');
+                await context.sync();
+                
+                if (searchResults.items && searchResults.items.length > 0) {
+                  const afterRange = searchResults.items[0];
+                  
+                  // Get the range before the after context (where the newline should be inserted)
+                  const insertPoint = afterRange.getRange(Word.RangeLocation.before);
+                  
+                  // Insert a paragraph break by inserting an empty paragraph
+                  const newPara = insertPoint.insertParagraph('', Word.InsertLocation.before);
+                  newPara.font.color = '#0000FF';
+                  
+                  await context.sync();
+                  
+                  insertedSuccessfully = true;
+                  applied++;
+                  console.log(`   ? Newline inserted successfully using insertBreak() (via after context)`);
+                }
+              }
+              
+              // Last resort: Try shorter context
+              if (!insertedSuccessfully && beforeCtx.length >= 3) {
+                const searchText = beforeCtx.substring(Math.max(0, beforeCtx.length - 10));
+                const searchResults = body.search(searchText, {
+                  matchCase: false,
+                  matchWholeWord: false
+                });
+                searchResults.load('items');
+                await context.sync();
+                
+                if (searchResults.items && searchResults.items.length > 0) {
+                  const beforeRange = searchResults.items[searchResults.items.length - 1];
+                  const insertPoint = beforeRange.getRange(Word.RangeLocation.after);
+                  const newPara = insertPoint.insertParagraph('', Word.InsertLocation.before);
+                  newPara.font.color = '#0000FF';
+                  
+                  await context.sync();
+                  
+                  insertedSuccessfully = true;
+                  applied++;
+                  console.log(`   ? Newline inserted successfully using insertBreak() (short context)`);
+                }
+              }
+              
+              if (!insertedSuccessfully) {
+                skipped++;
+                console.warn(`   ?? Could not find insertion point for newline`);
+              }
+            } catch (e) {
+              skipped++;
+              console.error(`   ?? Error inserting newline: ${e.message}`);
+            }
+            
+            // Skip the rest of insertion processing for newlines
+            continue;
+          }
+          
           console.log(`${prefix} INSERT at pos ${op.position}: "${op.text.substring(0, 40)}..."`);
           console.log(`           Position in original: ${op.position}`);
           
