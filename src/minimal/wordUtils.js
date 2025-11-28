@@ -288,6 +288,9 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
         // Check if this is a newline insertion
         const isNewlineInsert = diff.isNewline || (diff.text === '\r' || diff.text === '\n' || diff.text === '\r\n');
         
+        // Declare insertContext in outer scope so it's accessible after the if/else
+        let insertContext;
+        
         // For newline insertions, build context from ORIGINAL text (not normalized with placeholders)
         if (isNewlineInsert) {
           // Build context from original text at insertion point
@@ -303,7 +306,7 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
           beforeContext = beforeContext.replace(/\r/g, '').normalize('NFC');
           afterContext = afterContext.replace(/\r/g, '').normalize('NFC');
           
-          const insertContext = {
+          insertContext = {
             pattern: beforeContext + NEWLINE_PLACEHOLDER + afterContext,
             target: NEWLINE_PLACEHOLDER,
             beforeContext: beforeContext,
@@ -332,7 +335,7 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
           const insertTextNormalized = normalizeText(insertText);
           
           // Find unique context for insertion point
-          const insertContext = findUniqueContext(normalized, currentPos, currentPos, '');
+          insertContext = findUniqueContext(normalized, currentPos, currentPos, '');
           
           positionMap.push({
             index: i,
