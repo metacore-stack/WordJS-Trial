@@ -612,7 +612,7 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
                 }
               } else {
                 // Pattern not found - try multiple fallback strategies
-                console.warn(`   ?? Full pattern not found, trying fallback strategies`);
+                console.log(`   ?? Full pattern not found, trying fallback strategies`);
                 const afterCtx = normalizeText(op.context.afterContext);
                 const beforeCtx = normalizeText(op.context.beforeContext);
                 const targetText = normalizeText(op.text);
@@ -684,9 +684,255 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
                   }
                 }
                 
-                // Fallback 3: Direct search (last resort)
+                // Fallback 3: Try searching for meaningful part (without leading whitespace)
                 if (!deletedSuccessfully) {
-                  console.log(`   Fallback 3: Trying direct search`);
+                  console.log(`   Fallback 3: Trying meaningful-part search`);
+                  try {
+                    // Try searching for the meaningful part (trimmed or first word)
+                    const trimmedTarget = targetText.trim();
+                    const firstWord = targetText.match(/[^\s\r\n]+/)?.[0]; // First non-whitespace sequence
+                    
+                    const searchTargets = [];
+                    if (trimmedTarget.length > 0 && trimmedTarget !== targetText) {
+                      searchTargets.push({text: trimmedTarget, desc: 'trimmed'});
+                    }
+                    if (firstWord && firstWord !== targetText && firstWord.length >= 3) {
+                      searchTargets.push({text: firstWord, desc: 'first-word'});
+                    }
+                    
+                    for (const {text: searchText, desc} of searchTargets) {
+                      if (deletedSuccessfully) break;
+                      
+                      const body = context.document.body;
+                      const partSearch = body.search(searchText, {matchCase: false, matchWholeWord: false});
+                      partSearch.load('items');
+                      await context.sync();
+                      
+                      if (partSearch.items && partSearch.items.length > 0) {
+                        // Use the last match (since we process in reverse order)
+                        const match = partSearch.items[partSearch.items.length - 1];
+                        
+                        // Try to find the full target text near this match
+                        // Search in document body with the meaningful part + target
+                        try {
+                          match.load('text');
+                          await context.sync();
+                          
+                          if (!match.text) {
+                            throw new Error('Match text is empty');
+                          }
+                          
+                          // Check if target has leading whitespace that we need to delete
+                          const leadingWhitespace = targetText.match(/^[\s\r\n]+/)?.[0] || '';
+                          
+                          if (leadingWhitespace.length > 0) {
+                            // CRITICAL: Try to delete whitespace FIRST, then meaningful part
+                            // This is more reliable because the document structure is still intact
+                            
+                            // Step 1: Try to find and delete the whitespace BEFORE deleting the meaningful part
+                            const whitespaceOnly = leadingWhitespace.replace(/\r/g, ''); // Remove \r for search
+                            
+                            if (whitespaceOnly.length > 0) {
+                              // Search for before context + whitespace + meaningful part
+                              const beforeCtx = op.context.beforeContext.substring(Math.max(0, op.context.beforeContext.length - 20));
+                              const fullPattern = beforeCtx + whitespaceOnly + searchText;
+                              
+                              try {
+                                const fullPatternSearch = context.document.body.search(fullPattern.substring(0, 255), {
+                                  matchCase: false,
+                                  matchWholeWord: false
+                                });
+                                fullPatternSearch.load('items');
+                                await context.sync();
+                                
+                                if (fullPatternSearch.items && fullPatternSearch.items.length > 0) {
+                                  // Found the full pattern! Now search for the full target within it
+                                  const fullRange = fullPatternSearch.items[0];
+                                  
+                                  // Search for the complete target (whitespace + meaningful part) in this range
+                                  const completeTarget = whitespaceOnly + searchText;
+                                  const targetInRange = fullRange.search(completeTarget, {
+                                    matchCase: false,
+                                    matchWholeWord: false
+                                  });
+                                  targetInRange.load('items');
+                                  await context.sync();
+                                  
+                                  if (targetInRange.items && targetInRange.items.length > 0) {
+                                    // Delete the complete target (whitespace + part)
+                                    targetInRange.items[0].delete();
+                                    await context.sync();
+                                    applied++;
+                                    deletedSuccessfully = true;
+                                    console.log(`   ? Deleted (fallback 3: ${desc} search, full target with whitespace)`);
+                                    break;
+                                  }
+                                }
+                              } catch (fullPatternError) {
+                                console.warn(`   ?? Full pattern search failed: ${getErrorMessage(fullPatternError)}`);
+                              }
+                              
+                              // Step 2: If full pattern failed, try deleting whitespace separately BEFORE meaningful part
+                              if (!deletedSuccessfully) {
+                                // Search for whitespace using before context
+                                const beforeCtx = op.context.beforeContext.substring(Math.max(0, op.context.beforeContext.length - 20));
+                                const wsPattern = beforeCtx + whitespaceOnly;
+                                
+                                try {
+                                  const wsSearch = context.document.body.search(wsPattern.substring(0, 255), {
+                                    matchCase: false,
+                                    matchWholeWord: false
+                                  });
+                                  wsSearch.load('items');
+                                  await context.sync();
+                                  
+                                  if (wsSearch.items && wsSearch.items.length > 0) {
+                                    const wsMatch = wsSearch.items[wsSearch.items.length - 1];
+                                    
+                                    // Try to find just the whitespace within this match
+                                    const wsInMatch = wsMatch.search(whitespaceOnly, {
+                                      matchCase: false,
+                                      matchWholeWord: false
+                                    });
+                                    wsInMatch.load('items');
+                                    await context.sync();
+                                    
+                                    if (wsInMatch.items && wsInMatch.items.length > 0) {
+                                      // Delete whitespace first
+                                      wsInMatch.items[0].delete();
+                                      await context.sync();
+                                      console.log(`   ? Deleted leading whitespace first (${whitespaceOnly.length} chars)`);
+                                      
+                                      // CRITICAL: After deleting whitespace, the 'match' range may be invalid
+                                      // Re-search for the meaningful part to get a fresh, valid range
+                                      try {
+                                        const body = context.document.body;
+                                        const refreshedSearch = body.search(searchText, {matchCase: false, matchWholeWord: false});
+                                        refreshedSearch.load('items');
+                                        await context.sync();
+                                        
+                                        if (refreshedSearch.items && refreshedSearch.items.length > 0) {
+                                          // Use the last match (since we process in reverse order)
+                                          const refreshedMatch = refreshedSearch.items[refreshedSearch.items.length - 1];
+                                          refreshedMatch.delete();
+                                          await context.sync();
+                                          applied++;
+                                          deletedSuccessfully = true;
+                                          console.log(`   ? Deleted (fallback 3: ${desc} search, whitespace + part separately)`);
+                                          break;
+                                        } else {
+                                          console.warn(`   ?? Could not find meaningful part after whitespace deletion`);
+                                        }
+                                      } catch (refreshError) {
+                                        console.warn(`   ?? Failed to refresh search after whitespace deletion: ${getErrorMessage(refreshError)}`);
+                                      }
+                                    }
+                                  }
+                                } catch (wsError) {
+                                  console.warn(`   ?? Whitespace deletion failed: ${getErrorMessage(wsError)}`);
+                                }
+                              }
+                            }
+                          }
+                          
+                          // If we still haven't deleted, delete just the meaningful part
+                          if (!deletedSuccessfully) {
+                            // Verify match is still valid before using it
+                            try {
+                              match.load('text');
+                              await context.sync();
+                              
+                              if (match.text !== null && match.text !== undefined) {
+                                match.delete();
+                                await context.sync();
+                                applied++;
+                                deletedSuccessfully = true;
+                                if (leadingWhitespace.length > 0) {
+                                  console.log(`   ? Deleted (fallback 3: ${desc} search, partial match - whitespace cleanup attempted)`);
+                                } else {
+                                  console.log(`   ? Deleted (fallback 3: ${desc} search, partial match)`);
+                                }
+                                break;
+                              } else {
+                                // Match is invalid, re-search
+                                throw new Error('Match range is invalid, need to re-search');
+                              }
+                            } catch (matchError) {
+                              // Match might be invalid, re-search for it
+                              console.warn(`   ?? Match may be invalid, re-searching: ${getErrorMessage(matchError)}`);
+                              const body = context.document.body;
+                              const refreshedSearch = body.search(searchText, {matchCase: false, matchWholeWord: false});
+                              refreshedSearch.load('items');
+                              await context.sync();
+                              
+                              if (refreshedSearch.items && refreshedSearch.items.length > 0) {
+                                const refreshedMatch = refreshedSearch.items[refreshedSearch.items.length - 1];
+                                refreshedMatch.delete();
+                                await context.sync();
+                                applied++;
+                                deletedSuccessfully = true;
+                                console.log(`   ? Deleted (fallback 3: ${desc} search, partial match - re-searched)`);
+                                break;
+                              }
+                            }
+                          }
+                        } catch (expandError) {
+                          // If expansion fails, try to delete the match, but re-search if needed
+                          const expandErrorMsg = getErrorMessage(expandError);
+                          console.warn(`   ?? Expansion failed: ${expandErrorMsg}`);
+                          try {
+                            // Try to verify match is valid first
+                            match.load('text');
+                            await context.sync();
+                            
+                            if (match.text !== null && match.text !== undefined) {
+                              match.delete();
+                              await context.sync();
+                              applied++;
+                              deletedSuccessfully = true;
+                              console.log(`   ? Deleted (fallback 3: ${desc} search, partial match)`);
+                              break;
+                            } else {
+                              throw new Error('Match range is invalid');
+                            }
+                          } catch (deleteError) {
+                            // Match is invalid, try re-searching
+                            try {
+                              const body = context.document.body;
+                              const refreshedSearch = body.search(searchText, {matchCase: false, matchWholeWord: false});
+                              refreshedSearch.load('items');
+                              await context.sync();
+                              
+                              if (refreshedSearch.items && refreshedSearch.items.length > 0) {
+                                const refreshedMatch = refreshedSearch.items[refreshedSearch.items.length - 1];
+                                refreshedMatch.delete();
+                                await context.sync();
+                                applied++;
+                                deletedSuccessfully = true;
+                                console.log(`   ? Deleted (fallback 3: ${desc} search, partial match - re-searched after error)`);
+                                break;
+                              } else {
+                                const deleteErrorMsg = getErrorMessage(deleteError);
+                                console.error(`   ❌ Failed to delete match: ${deleteErrorMsg}`);
+                                throw deleteError;
+                              }
+                            } catch (refreshError) {
+                              const deleteErrorMsg = getErrorMessage(deleteError);
+                              console.error(`   ❌ Failed to delete match: ${deleteErrorMsg}`);
+                              throw deleteError;
+                            }
+                          }
+                        }
+                      }
+                    }
+                  } catch (e) {
+                    console.warn(`   ?? Fallback 3 (meaningful-part) failed: ${getErrorMessage(e)}`);
+                  }
+                }
+                
+                // Fallback 4: Direct search (last resort)
+                if (!deletedSuccessfully) {
+                  console.log(`   Fallback 4: Trying direct search`);
                   try {
                     const body = context.document.body;
                     const directSearch = body.search(targetText, {matchCase: false, matchWholeWord: false});
@@ -700,15 +946,15 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
                       await context.sync();
                       applied++;
                       deletedSuccessfully = true;
-                      console.log(`   ? Deleted (fallback 3: direct search, match ${directSearch.items.length} of ${directSearch.items.length})`);
+                      console.log(`   ? Deleted (fallback 4: direct search, match ${directSearch.items.length} of ${directSearch.items.length})`);
                     }
                   } catch (e) {
-                    console.warn(`   ?? Fallback 3 failed: ${e.message}`);
+                    console.warn(`   ?? Fallback 4 failed: ${getErrorMessage(e)}`);
                   }
                 }
                 
                 if (!deletedSuccessfully) {
-                  skipped++;
+                skipped++;
                   console.warn(`   ?? All fallbacks failed, pattern not found in document`);
                 }
               }
@@ -755,7 +1001,7 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
               applied++;
               console.log(`   ? Inserted successfully (formatted blue)`);
             } else {
-              console.warn(`   ?? Before-context not found, trying after-context...`);
+              console.log(`   ?? Before-context not found, trying after-context...`);
             }
           }
           
@@ -786,14 +1032,21 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
               applied++;
               console.log(`   ? Inserted successfully (formatted blue)`);
             } else {
-              console.warn(`   ?? After-context not found`);
+              console.log(`   ?? After-context not found`);
             }
           }
           
           // LAST RESORT: Try shorter context (5-10 chars) which is more stable after deletions
           if (!insertedSuccessfully && op.context.beforeContext.length >= 5) {
-            const shortContext = op.context.beforeContext.substring(Math.max(0, op.context.beforeContext.length - 10));
-            console.log(`   ? Last resort: searching for short context: "${shortContext}"`);
+            // Try progressively shorter contexts to find a unique match
+            const contextSizes = [10, 8, 5];
+            
+            for (const size of contextSizes) {
+              if (insertedSuccessfully) break;
+              
+              if (op.context.beforeContext.length >= size) {
+                const shortContext = op.context.beforeContext.substring(Math.max(0, op.context.beforeContext.length - size));
+                console.log(`   ? Last resort: searching for short context (${size} chars): "${shortContext}"`);
             
             const body = context.document.body;
             const searchResults = body.search(shortContext, {
@@ -804,17 +1057,154 @@ export async function replaceSelectionWithNativeTrackedRevisions(diffs, wasTrack
             await context.sync();
             
             if (searchResults.items && searchResults.items.length > 0) {
-              const beforeRange = searchResults.items[searchResults.items.length - 1]; // Use last match (closer to end)
+                  // If multiple matches, try to verify we have the right one using after context
+                  let selectedRange = searchResults.items[searchResults.items.length - 1]; // Default: use last match
+                  
+                  if (searchResults.items.length > 1 && op.context.afterContext.length >= 3) {
+                    // Try to find the match that has the correct after context
+                    const shortAfterCtx = op.context.afterContext.substring(0, Math.min(10, op.context.afterContext.length));
+                    
+                    for (let i = searchResults.items.length - 1; i >= 0; i--) {
+                      try {
+                        const match = searchResults.items[i];
+                        const afterMatch = match.getRange(Word.RangeLocation.after);
+                        afterMatch.load('text');
+                        await context.sync();
+                        
+                        if (afterMatch.text && afterMatch.text.toLowerCase().startsWith(shortAfterCtx.toLowerCase())) {
+                          selectedRange = match;
+                          break;
+                        }
+                      } catch (e) {
+                        // If we can't check this match, continue
+                        continue;
+                      }
+                    }
+                  }
               
               // Insert and format as blue
-              const insertedRange = beforeRange.insertText(op.text, Word.InsertLocation.after);
+                  const insertedRange = selectedRange.insertText(op.text, Word.InsertLocation.after);
               insertedRange.font.color = '#0000FF'; // Blue for insertions
               
               await context.sync();
               
               insertedSuccessfully = true;
               applied++;
-              console.log(`   ? Inserted successfully (using short context)`);
+                  console.log(`   ? Inserted successfully (using short context, ${size} chars)`);
+                  break;
+                }
+              }
+            }
+          }
+          
+          // FINAL RESORT: Try searching for key patterns that might still exist
+          if (!insertedSuccessfully) {
+            console.log(`   ? Final resort: searching for key patterns`);
+            
+            // Try progressively shorter context sizes
+            const contextSizes = [8, 5, 3];
+            let found = false;
+            
+            for (const size of contextSizes) {
+              if (found || insertedSuccessfully) break;
+              
+              if (op.context.beforeContext.length >= size) {
+                const contextPart = op.context.beforeContext.substring(Math.max(0, op.context.beforeContext.length - size));
+                const body = context.document.body;
+                
+                try {
+                  const contextSearch = body.search(contextPart, {
+                    matchCase: false,
+                    matchWholeWord: false
+                  });
+                  contextSearch.load('items');
+                  await context.sync();
+                  
+                  if (contextSearch.items && contextSearch.items.length > 0) {
+                    const beforeRange = contextSearch.items[contextSearch.items.length - 1];
+                    
+                    // Insert and format as blue
+                    const insertedRange = beforeRange.insertText(op.text, Word.InsertLocation.after);
+                    insertedRange.font.color = '#0000FF';
+                    
+                    await context.sync();
+                    
+                    insertedSuccessfully = true;
+                    applied++;
+                    found = true;
+                    console.log(`   ? Inserted successfully (using final resort, context size: ${size})`);
+                    break;
+                  }
+                } catch (contextError) {
+                  console.warn(`   ?? Context search (size ${size}) failed: ${getErrorMessage(contextError)}`);
+                }
+              }
+            }
+            
+            // If still not inserted, try searching for common punctuation or key words
+            if (!insertedSuccessfully) {
+              // Look for common patterns that might still exist even after deletions
+              // Order matters: more specific patterns first
+              const keyPatterns = ['configured to:', 'configured to', 'to: ', 'to:', 'processor is', ':'];
+              
+              for (const pattern of keyPatterns) {
+                if (insertedSuccessfully) break;
+                
+                try {
+                  const body = context.document.body;
+                  const patternSearch = body.search(pattern, {
+                    matchCase: false,
+                    matchWholeWord: false
+                  });
+                  patternSearch.load('items');
+                  await context.sync();
+                  
+                  if (patternSearch.items && patternSearch.items.length > 0) {
+                    // Try to narrow down which match to use by checking if it's near the expected position
+                    // Since we process in reverse order, we want the match that's closest to where
+                    // the insertion should be based on the original position
+                    
+                    let selectedMatch = patternSearch.items[patternSearch.items.length - 1];
+                    
+                    // If multiple matches, try to use context to find the right one
+                    if (patternSearch.items.length > 1 && op.context.beforeContext.length >= 3) {
+                      // Try to find a match that has the before context nearby
+                      const shortBeforeCtx = op.context.beforeContext.substring(Math.max(0, op.context.beforeContext.length - 10));
+                      
+                      for (let i = patternSearch.items.length - 1; i >= 0; i--) {
+                        try {
+                          const match = patternSearch.items[i];
+                          // Get text before this match to see if it matches our context
+                          const beforeMatch = match.getRange(Word.RangeLocation.before);
+                          beforeMatch.load('text');
+                          await context.sync();
+                          
+                          if (beforeMatch.text && beforeMatch.text.toLowerCase().includes(shortBeforeCtx.toLowerCase())) {
+                            selectedMatch = match;
+                            break;
+                          }
+                        } catch (e) {
+                          // If we can't check this match, continue to next
+                          continue;
+                        }
+                      }
+                    }
+                    
+                    // Insert after the pattern
+                    const insertedRange = selectedMatch.insertText(op.text, Word.InsertLocation.after);
+                    insertedRange.font.color = '#0000FF';
+                    
+                    await context.sync();
+                    
+                    insertedSuccessfully = true;
+                    applied++;
+                    console.log(`   ? Inserted successfully (using key pattern: "${pattern}")`);
+                    break;
+                  }
+                } catch (patternError) {
+                  console.log(`   ?? Pattern search ("${pattern}") failed: ${getErrorMessage(patternError)}`);
+                }
+              }
             }
           }
           

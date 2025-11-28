@@ -249,30 +249,164 @@ export function computeWordLevelDiff(oldText, newText) {
   const oldStr = oldText || '';
   const newStr = newText || '';
   
-  // Compute diff
-  const diffs = dmp.diff_main(oldStr, newStr);
+  /**
+   * Normalize newline characters: treat \r, \n, and \r\n as equivalent
+   * This prevents unnecessary delete/insert operations when only newline type differs
+   * We normalize to \n for consistency, then convert back to \r for Word after diffing
+   */
+  function normalizeNewlinesForDiff(text) {
+    // Replace \r\n with \n first (to avoid double replacement)
+    // Then replace remaining \r with \n
+    return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  }
+  
+  // Normalize newlines before diffing (treat \r and \n as equivalent)
+  const normalizedOld = normalizeNewlinesForDiff(oldStr);
+  const normalizedNew = normalizeNewlinesForDiff(newStr);
+  
+  // Compute diff on normalized text
+  const diffs = dmp.diff_main(normalizedOld, normalizedNew);
   dmp.diff_cleanupSemantic(diffs);
   
-  // Refine diff to handle repeated patterns
-  const refinedDiffs = refineDiffForRepeatedPatterns(diffs, oldStr, newStr);
+  // Refine diff to handle repeated patterns (using normalized text)
+  const refinedDiffs = refineDiffForRepeatedPatterns(diffs, normalizedOld, normalizedNew);
   
   // Convert diff-match-patch format to our format
+  // Split newlines into separate operations for better handling
   const wordDiffs = [];
   
+  /**
+   * Split text by newlines and return array of {text, hasNewline}
+   * Since we normalized \r and \n to \n before diffing, we only see \n here
+   * We convert \n back to \r for Word compatibility (Word uses \r for line breaks)
+   */
+  function splitByNewlines(text) {
+    const parts = [];
+    let current = '';
+    
+    for (let i = 0; i < text.length; i++) {
+      const char = text[i];
+      
+      // After normalization, we only have \n (convert to \r for Word)
+      if (char === '\n') {
+        if (current) {
+          parts.push({ text: current, hasNewline: false });
+          current = '';
+        }
+        // Use \r for Word compatibility (Word uses \r for line breaks)
+        parts.push({ text: '\r', hasNewline: true });
+      }
+      else {
+        current += char;
+      }
+    }
+    
+    if (current) {
+      parts.push({ text: current, hasNewline: false });
+    }
+    
+    return parts;
+  }
+  
   for (const [op, text] of refinedDiffs) {
-    if (op === 0) {
-      // Equal text
-      wordDiffs.push({ op: 'equal', text: text });
-    } else if (op === -1) {
-      // Deletion
-      wordDiffs.push({ op: 'delete', text: text });
-    } else if (op === 1) {
-      // Insertion
-      wordDiffs.push({ op: 'insert', text: text });
+    // Split by newlines to handle them separately
+    const parts = splitByNewlines(text);
+    
+    for (const part of parts) {
+      if (part.hasNewline) {
+        // Newline is a separate operation
+        if (op === 0) {
+          wordDiffs.push({ op: 'equal', text: part.text });
+        } else if (op === -1) {
+          wordDiffs.push({ op: 'delete', text: part.text });
+        } else if (op === 1) {
+          wordDiffs.push({ op: 'insert', text: part.text });
+        }
+      } else if (part.text) {
+        // Regular text (non-empty)
+        if (op === 0) {
+          wordDiffs.push({ op: 'equal', text: part.text });
+        } else if (op === -1) {
+          wordDiffs.push({ op: 'delete', text: part.text });
+        } else if (op === 1) {
+          wordDiffs.push({ op: 'insert', text: part.text });
+        }
+      }
     }
   }
   
-  return wordDiffs;
+  /**
+   * Post-process: Merge delete+insert of the same newline that are in the same logical position
+   * This handles cases where \r and \n are treated as equivalent but appear as separate operations
+   * 
+   * Strategy: Look for patterns like [delete newline, ...other ops..., insert newline]
+   * where the newlines are in the same logical position (before/after the same text changes)
+   */
+  const mergedDiffs = [];
+  let i = 0;
+  
+  while (i < wordDiffs.length) {
+    const current = wordDiffs[i];
+    
+    // Check if current is a delete newline
+    if (current.op === 'delete' && (current.text === '\r' || current.text === '\n')) {
+      // Look ahead to see if there's a matching insert newline
+      // They should be in the same logical position if there are only text changes between them
+      let foundMatchingInsert = false;
+      let j = i + 1;
+      let textOpsBetween = 0; // Count non-newline operations between
+      
+      while (j < wordDiffs.length && textOpsBetween < 3) {
+        const candidate = wordDiffs[j];
+        
+        // If we find an insert newline, check if it's in the same logical position
+        if (candidate.op === 'insert' && (candidate.text === '\r' || candidate.text === '\n')) {
+          // Check if there are only text changes (delete/insert) between them, no equal ops
+          // This indicates they're in the same logical position
+          let onlyTextChanges = true;
+          for (let k = i + 1; k < j; k++) {
+            if (wordDiffs[k].op === 'equal') {
+              onlyTextChanges = false;
+              break;
+            }
+          }
+          
+          if (onlyTextChanges) {
+            // Merge into equal operation (newline is unchanged, just normalized)
+            mergedDiffs.push({ op: 'equal', text: '\r' }); // Use \r for Word
+            
+            // Add all operations between (they're text changes)
+            for (let k = i + 1; k < j; k++) {
+              mergedDiffs.push(wordDiffs[k]);
+            }
+            
+            i = j + 1; // Skip both newlines and process from after the insert
+            foundMatchingInsert = true;
+            break;
+          }
+        }
+        
+        // Count non-newline operations
+        if (candidate.text !== '\r' && candidate.text !== '\n') {
+          textOpsBetween++;
+        }
+        
+        j++;
+      }
+      
+      if (!foundMatchingInsert) {
+        // No matching insert found, keep the delete
+        mergedDiffs.push(current);
+        i++;
+      }
+    } else {
+      // Not a delete newline, just add it
+      mergedDiffs.push(current);
+      i++;
+    }
+  }
+  
+  return mergedDiffs;
 }
 
 /**
