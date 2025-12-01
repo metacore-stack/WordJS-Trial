@@ -23,6 +23,26 @@ function escapeXml(str) {
 }
 
 /**
+ * Advanced normalization for consistent newline handling
+ * Normalizes all newline variations (\r\n, \r, \n) to \n for diffing
+ */
+function normalizeNewlines(text) {
+  if (!text) return '';
+  // Replace \r\n with \n first (to avoid double replacement)
+  // Then replace remaining \r with \n
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+/**
+ * Denormalize newlines back to Word format (\r)
+ */
+function denormalizeNewlines(text) {
+  if (!text) return '';
+  // Convert \n back to \r for Word compatibility
+  return text.replace(/\n/g, '\r');
+}
+
+/**
  * Tokenize text into words, preserving whitespace and punctuation
  * Returns an array of tokens with their text and type (word, space, punctuation)
  */
@@ -241,72 +261,120 @@ function splitDeleteInsertPair(deletedText, insertedText, oldText, newText) {
 }
 
 /**
- * Compute word-level diff and return operations for OOXML generation
- * Returns array of { op: 'equal'|'delete'|'insert', text: string }
+ * ENHANCED: Split text by newlines into separate operations
+ * This ensures newlines are handled as distinct operations with proper context
+ */
+function splitByNewlines(text) {
+  const parts = [];
+  let current = '';
+  
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    
+    // After normalization, we only have \n
+    if (char === '\n') {
+      if (current) {
+        parts.push({ text: current, hasNewline: false });
+        current = '';
+      }
+      // Push newline as separate item (will be converted to \r for Word)
+      parts.push({ text: '\r', hasNewline: true });
+    }
+    else {
+      current += char;
+    }
+  }
+  
+  if (current) {
+    parts.push({ text: current, hasNewline: false });
+  }
+  
+  return parts;
+}
+
+/**
+ * ENHANCED: Merge consecutive newline operations
+ * If there are multiple consecutive newlines in old and new text,
+ * they should be treated as a group to avoid fragmentation
+ */
+function mergeConsecutiveNewlines(wordDiffs) {
+  const merged = [];
+  let i = 0;
+
+  while (i < wordDiffs.length) {
+    const current = wordDiffs[i];
+
+    // Check if this is the start of a newline sequence
+    if (current.isNewline) {
+      // NEW STRATEGY: Merge ALL consecutive newlines of same operation type
+      // This groups multiple newline deletions into ONE tracked change
+      // User accepts once → all newlines in the group are handled
+      const sequence = [current];
+      let j = i + 1;
+
+      while (j < wordDiffs.length && wordDiffs[j].isNewline && wordDiffs[j].op === current.op) {
+        sequence.push(wordDiffs[j]);
+        j++;
+      }
+
+      // Merge consecutive newlines of same type
+      if (sequence.length > 1) {
+        merged.push({
+          op: current.op,
+          text: sequence.map(s => s.text).join(''),
+          isNewline: true,
+          count: sequence.length
+        });
+        i = j;
+      } else {
+        // Single newline - keep as is
+        merged.push(current);
+        i++;
+      }
+    } else {
+      // Not a newline - keep as is
+      merged.push(current);
+      i++;
+    }
+  }
+
+  return merged;
+}
+
+/**
+ * ENHANCED: Compute word-level diff with superior newline handling
+ * Returns array of { op: 'equal'|'delete'|'insert', text: string, isNewline?: boolean }
  */
 export function computeWordLevelDiff(oldText, newText) {
   // Use diff-match-patch directly with word-level granularity
   const oldStr = oldText || '';
   const newStr = newText || '';
   
-  /**
-   * Normalize newline characters: treat \r, \n, and \r\n as equivalent
-   * This prevents unnecessary delete/insert operations when only newline type differs
-   * We normalize to \n for consistency, then convert back to \r for Word after diffing
-   */
-  function normalizeNewlinesForDiff(text) {
-    // Replace \r\n with \n first (to avoid double replacement)
-    // Then replace remaining \r with \n
-    return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  }
+  console.log('?? Computing diff...');
+  console.log(`   Old text: ${oldStr.length} chars`);
+  console.log(`   New text: ${newStr.length} chars`);
   
-  // Normalize newlines before diffing (treat \r and \n as equivalent)
-  const normalizedOld = normalizeNewlinesForDiff(oldStr);
-  const normalizedNew = normalizeNewlinesForDiff(newStr);
+  // Normalize newlines before diffing (treat \r, \n, and \r\n as equivalent)
+  const normalizedOld = normalizeNewlines(oldStr);
+  const normalizedNew = normalizeNewlines(newStr);
+  
+  console.log(`   Normalized old: ${normalizedOld.length} chars`);
+  console.log(`   Normalized new: ${normalizedNew.length} chars`);
   
   // Compute diff on normalized text
   const diffs = dmp.diff_main(normalizedOld, normalizedNew);
   dmp.diff_cleanupSemantic(diffs);
   
+  console.log(`   Raw diffs: ${diffs.length} operations`);
+  
   // Refine diff to handle repeated patterns (using normalized text)
   const refinedDiffs = refineDiffForRepeatedPatterns(diffs, normalizedOld, normalizedNew);
+  
+  console.log(`   Refined diffs: ${refinedDiffs.length} operations`);
   
   // Convert diff-match-patch format to our format
   // Split newlines into separate operations for better handling
   const wordDiffs = [];
-  
-  /**
-   * Split text by newlines and return array of {text, hasNewline}
-   * Since we normalized \r and \n to \n before diffing, we only see \n here
-   * We convert \n back to \r for Word compatibility (Word uses \r for line breaks)
-   */
-  function splitByNewlines(text) {
-    const parts = [];
-    let current = '';
-    
-    for (let i = 0; i < text.length; i++) {
-      const char = text[i];
-      
-      // After normalization, we only have \n (convert to \r for Word)
-      if (char === '\n') {
-        if (current) {
-          parts.push({ text: current, hasNewline: false });
-          current = '';
-        }
-        // Use \r for Word compatibility (Word uses \r for line breaks)
-        parts.push({ text: '\r', hasNewline: true });
-      }
-      else {
-        current += char;
-      }
-    }
-    
-    if (current) {
-      parts.push({ text: current, hasNewline: false });
-    }
-    
-    return parts;
-  }
   
   for (const [op, text] of refinedDiffs) {
     // Split by newlines to handle them separately
@@ -314,7 +382,7 @@ export function computeWordLevelDiff(oldText, newText) {
     
     for (const part of parts) {
       if (part.hasNewline) {
-        // Newline is a separate operation - mark it specially so it can be handled differently
+        // Newline is a separate operation - mark it specially
         if (op === 0) {
           wordDiffs.push({ op: 'equal', text: part.text, isNewline: true });
         } else if (op === -1) {
@@ -335,78 +403,81 @@ export function computeWordLevelDiff(oldText, newText) {
     }
   }
   
-  /**
-   * Post-process: Merge delete+insert of the same newline that are in the same logical position
-   * This handles cases where \r and \n are treated as equivalent but appear as separate operations
-   * 
-   * Strategy: Look for patterns like [delete newline, ...other ops..., insert newline]
-   * where the newlines are in the same logical position (before/after the same text changes)
-   */
-  const mergedDiffs = [];
-  let i = 0;
+  console.log(`   Split into ${wordDiffs.length} word-level operations`);
   
+  // ENHANCEMENT: Merge consecutive newlines
+  const mergedDiffs = mergeConsecutiveNewlines(wordDiffs);
+  
+  console.log(`   After merging consecutive newlines: ${mergedDiffs.length} operations`);
+  
+  // ENHANCEMENT: Smart newline consolidation
+  // If we have patterns like: [delete newline, text changes, insert newline]
+  // where the newlines are equivalent, convert to equal newline
+  const consolidatedDiffs = consolidateEquivalentNewlines(mergedDiffs);
+  
+  console.log(`   After consolidating equivalent newlines: ${consolidatedDiffs.length} operations`);
+  console.log('   ? Diff computation complete');
+  
+  return consolidatedDiffs;
+}
+
+/**
+ * ENHANCEMENT: Consolidate equivalent newlines
+ * If a newline is deleted and inserted in the same logical position,
+ * treat it as equal (unchanged)
+ */
+function consolidateEquivalentNewlines(wordDiffs) {
+  const consolidated = [];
+  let i = 0;
+
   while (i < wordDiffs.length) {
     const current = wordDiffs[i];
-    
-    // Check if current is a delete newline
-    if (current.op === 'delete' && (current.isNewline || current.text === '\r' || current.text === '\n')) {
-      // Look ahead to see if there's a matching insert newline
-      // They should be in the same logical position if there are only text changes between them
-      let foundMatchingInsert = false;
-      let j = i + 1;
-      let textOpsBetween = 0; // Count non-newline operations between
-      
-      while (j < wordDiffs.length && textOpsBetween < 3) {
+
+    // Check for pattern: delete newline, [optional text changes], insert newline
+    if (current.op === 'delete' && current.isNewline) {
+      // Look ahead for insert newline
+      let foundInsert = false;
+      let textChangesOnly = true;
+      let insertIndex = -1;
+
+      for (let j = i + 1; j < Math.min(i + 10, wordDiffs.length); j++) {
         const candidate = wordDiffs[j];
-        
-        // If we find an insert newline, check if it's in the same logical position
-        if (candidate.op === 'insert' && (candidate.isNewline || candidate.text === '\r' || candidate.text === '\n')) {
-          // Check if there are only text changes (delete/insert) between them, no equal ops
-          // This indicates they're in the same logical position
-          let onlyTextChanges = true;
-          for (let k = i + 1; k < j; k++) {
-            if (wordDiffs[k].op === 'equal') {
-              onlyTextChanges = false;
-              break;
-            }
-          }
-          
-          if (onlyTextChanges) {
-            // Merge into equal operation (newline is unchanged, just normalized)
-            mergedDiffs.push({ op: 'equal', text: '\r', isNewline: true }); // Use \r for Word
-            
-            // Add all operations between (they're text changes)
-            for (let k = i + 1; k < j; k++) {
-              mergedDiffs.push(wordDiffs[k]);
-            }
-            
-            i = j + 1; // Skip both newlines and process from after the insert
-            foundMatchingInsert = true;
-            break;
-          }
+
+        if (candidate.op === 'insert' && candidate.isNewline) {
+          foundInsert = true;
+          insertIndex = j;
+          break;
+        } else if (candidate.op === 'equal') {
+          // Equal text breaks the pattern
+          textChangesOnly = false;
+          break;
         }
+        // delete/insert text is OK
+      }
+
+      if (foundInsert && textChangesOnly) {
+        console.log(`   Found equivalent newline pair at positions ${i} and ${insertIndex}`);
         
-        // Count non-newline operations
-        if (!candidate.isNewline && candidate.text !== '\r' && candidate.text !== '\n') {
-          textOpsBetween++;
+        // Convert to equal newline
+        consolidated.push({ op: 'equal', text: '\r', isNewline: true });
+
+        // Add all text changes between
+        for (let k = i + 1; k < insertIndex; k++) {
+          consolidated.push(wordDiffs[k]);
         }
-        
-        j++;
+
+        // Skip to after the insert
+        i = insertIndex + 1;
+        continue;
       }
-      
-      if (!foundMatchingInsert) {
-        // No matching insert found, keep the delete
-        mergedDiffs.push(current);
-        i++;
-      }
-    } else {
-      // Not a delete newline, just add it
-      mergedDiffs.push(current);
-      i++;
     }
+
+    // No consolidation - keep as is
+    consolidated.push(current);
+    i++;
   }
-  
-  return mergedDiffs;
+
+  return consolidated;
 }
 
 /**
